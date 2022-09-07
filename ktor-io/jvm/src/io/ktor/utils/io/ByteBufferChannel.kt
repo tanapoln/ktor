@@ -10,6 +10,7 @@ import io.ktor.utils.io.pool.*
 import kotlinx.atomicfu.*
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
+import org.slf4j.*
 import java.io.EOFException
 import java.lang.Double.*
 import java.lang.Float.*
@@ -19,6 +20,7 @@ import kotlin.coroutines.intrinsics.*
 
 internal const val DEFAULT_CLOSE_MESSAGE: String = "Byte channel was closed"
 private const val BYTE_BUFFER_CAPACITY: Int = 4088
+private val log = LoggerFactory.getLogger("io.ktor.utils.io.ByteBufferChannel")
 
 // implementation for ByteChannel
 @Suppress("DEPRECATION", "OverridingDeprecatedMember")
@@ -226,19 +228,23 @@ internal open class ByteBufferChannel(
                     allocatedState?.let { releaseBuffer(it) }
                     return null
                 }
+
                 closed != null -> {
                     allocatedState?.let { releaseBuffer(it) }
                     rethrowClosed(closed!!.sendException)
                 }
+
                 state === ReadWriteBufferState.IdleEmpty -> {
                     val allocated = allocatedState ?: newBuffer().also { allocatedState = it }
                     allocated.startWriting()
                 }
+
                 state === ReadWriteBufferState.Terminated -> {
                     allocatedState?.let { releaseBuffer(it) }
                     if (joining != null) return null
                     rethrowClosed(closed!!.sendException)
                 }
+
                 else -> {
                     state.startWriting()
                 }
@@ -290,6 +296,7 @@ internal open class ByteBufferChannel(
                     val cause = closed?.cause ?: return null
                     rethrowClosed(cause)
                 }
+
                 else -> {
                     closed?.cause?.let { rethrowClosed(it) }
                     if (state.capacity.availableForRead == 0) return null
@@ -406,11 +413,13 @@ internal open class ByteBufferChannel(
                     toRelease = state.initial
                     ReadWriteBufferState.Terminated
                 }
+
                 forceTermination && state is ReadWriteBufferState.IdleNonEmpty &&
                     state.capacity.tryLockForRelease() -> {
                     toRelease = state.initial
                     ReadWriteBufferState.Terminated
                 }
+
                 else -> return false
             }
         }
@@ -428,21 +437,66 @@ internal open class ByteBufferChannel(
         if (idx >= capacity() - reservedSize) idx - (capacity() - reservedSize) else idx
 
     private inline fun writing(block: ByteBufferChannel.(ByteBuffer, RingBufferCapacity) -> Unit) {
+        log.traceFn(this, "writing", "OnEnter")
+
         val current = joining?.let { resolveDelegation(this, it) } ?: this
-        val buffer = current.setupStateForWrite() ?: return
+        val buffer = current.setupStateForWrite() ?: run {
+            log.debugFn(this, "writing", "setupStateForWrite got null buffer, exit")
+            log.traceFn(this, "writing", "OnExit")
+            return
+        }
         val capacity = current.state.capacity
         val before = current.totalBytesWritten
+        log.traceFn(this, "writing", "before total bytes written. bytes={} current={}", before, current)
 
         try {
-            current.closed?.let { rethrowClosed(it.sendException) }
+            current.closed?.let {
+                log.debugFn(
+                    this,
+                    "writing",
+                    "current ByteBufferChannel has been closed, rethrow. current={} closed={}",
+                    current,
+                    it
+                )
+                rethrowClosed(it.sendException)
+            }
+            log.traceFn(this, "writing", "calling block. capacity={} channel={}", capacity, current)
             block(current, buffer, capacity)
+            log.debugFn(this, "writing", "block called. capacity={} channel={}", capacity, current)
         } finally {
-            if (capacity.isFull() || current.autoFlush) current.flush()
+            val isFull = capacity.isFull()
+            val autoFlush = current.autoFlush
+            if (isFull || autoFlush) {
+                log.traceFn(this, "writing", "buffer will be flushed. full={} autoFlush={}", isFull, autoFlush)
+                current.flush()
+                log.debugFn(this, "writing", "buffer flushed. full={} autoFlush={}", isFull, autoFlush)
+            }
             if (current !== this) {
-                totalBytesWritten += current.totalBytesWritten - before
+                val after = current.totalBytesWritten
+                val delta = after - before
+                val thisBytesWritten = totalBytesWritten + delta
+                totalBytesWritten = thisBytesWritten
+                log.debugFn(
+                    this,
+                    "writing",
+                    "update total bytes written from another buffer to this buffer. after={} before={} delta={} current={}",
+                    after,
+                    before,
+                    delta,
+                    current
+                )
+            } else {
+                log.traceFn(
+                    this,
+                    "writing",
+                    "after total bytes written. bytes={} current={}",
+                    current.totalBytesWritten,
+                    current
+                )
             }
             current.restoreStateAfterWrite()
             current.tryTerminate()
+            log.traceFn(this, "writing", "OnExit")
         }
     }
 
@@ -494,29 +548,102 @@ internal open class ByteBufferChannel(
         var currentConsumed = consumed
         var currentMax = max
 
+        log.traceFn(this, "readAsMuchAsPossible", "OnEnter")
+
         do {
+            val beforeAvailForRead = state.capacity.availableForRead
+
             var part = 0
             val count = reading {
-                val dstSize = dst.writeRemaining
-                part = it.tryReadAtMost(minOf(remaining(), dstSize, currentMax))
+                val dstWriteRemaining = dst.writeRemaining
+                val remaining1 = remaining()
+                val min1 = minOf(remaining1, dstWriteRemaining, currentMax)
+                part = it.tryReadAtMost(min1)
                 if (part <= 0) {
+                    log.debugFn(
+                        this@ByteBufferChannel,
+                        "readAsMuchAsPossible.reading",
+                        "tryReadAtMost but got no part, return false. most={} remaining={} dstWriteRemaining={} currentMax={} buf={} capacity={}",
+                        min1,
+                        remaining1,
+                        dstWriteRemaining,
+                        currentMax,
+                        this,
+                        it
+                    )
                     return@reading false
                 }
 
-                if (dstSize < remaining()) {
-                    limit(position() + dstSize)
+                val remaining2 = remaining()
+                if (dstWriteRemaining < remaining2) {
+                    val position1 = position()
+                    val newLimit = position1 + dstWriteRemaining
+                    limit(newLimit)
+                    log.debugFn(
+                        this@ByteBufferChannel,
+                        "readAsMuchAsPossible.reading",
+                        "limit this buffer to match dstBuf capacity. limit={} position={} dstWriteRemaining={} remaining={} buf={}",
+                        newLimit,
+                        position1,
+                        dstWriteRemaining,
+                        remaining2,
+                        this
+                    )
                 }
 
                 dst.writeFully(this)
 
                 bytesRead(it, part)
+                log.traceFn(
+                    this@ByteBufferChannel,
+                    "readAsMuchAsPossible.reading",
+                    "read this buffer to dst buffer, return true. part={} dst={} buf={} capacity={}",
+                    part,
+                    dst,
+                    this,
+                    it
+                )
+
                 return@reading true
             }
 
-            currentConsumed += part
-            currentMax -= part
-        } while (count && dst.canWrite() && state.capacity.availableForRead > 0)
+            val oldCurrentConsumed = currentConsumed
+            currentConsumed = oldCurrentConsumed + part
+            val oldCurrentMax = currentMax
+            currentMax = oldCurrentMax - part
 
+            val canWrite = dst.canWrite()
+            val availForRead = state.capacity.availableForRead
+            val isContinue = count && canWrite && availForRead > 0
+            log.traceFn(
+                this,
+                "readAsMuchAsPossible",
+                "data read inner loop. currentConsumed={} currentMax={} part={} availableForRead={} beforeAvailForRead={} oldConsumed={} oldMax={} canWrite={} count={} isContinue={} dst={}",
+                currentConsumed,
+                currentMax,
+                part,
+                availForRead,
+                beforeAvailForRead,
+                oldCurrentConsumed,
+                oldCurrentMax,
+                canWrite,
+                count,
+                isContinue,
+                dst
+            )
+        } while (isContinue)
+
+        log.debugFn(
+            this,
+            "readAsMuchAsPossible",
+            "data read. currentConsumed={} currentMax={} initialConsumed={} maxConsume={} dst={}",
+            currentConsumed,
+            currentMax,
+            consumed,
+            max,
+            dst
+        )
+        log.traceFn(this, "readAsMuchAsPossible", "OnExit")
         return currentConsumed
     }
 
@@ -672,6 +799,7 @@ internal open class ByteBufferChannel(
                     -1
                 }
             }
+
             consumed > 0 || length == 0 -> consumed
             else -> readAvailableSuspend(dst, offset, length)
         }
@@ -688,6 +816,7 @@ internal open class ByteBufferChannel(
                     -1
                 }
             }
+
             consumed > 0 || !dst.hasRemaining() -> consumed
             else -> readAvailableSuspend(dst)
         }
@@ -704,6 +833,7 @@ internal open class ByteBufferChannel(
                     -1
                 }
             }
+
             consumed > 0 || !dst.canWrite() -> consumed
             else -> readAvailableSuspend(dst)
         }
@@ -2055,6 +2185,7 @@ internal open class ByteBufferChannel(
                         throw MalformedInputException("Illegal trailing bytes: ${buffer.remaining()}")
                     }
                 }
+
                 consumed1 == 0 && consumed0 == 0 -> {
                     result = false
                 }
@@ -2076,41 +2207,136 @@ internal open class ByteBufferChannel(
         return sb.toString()
     }
 
-    override suspend fun readRemaining(limit: Long): ByteReadPacket = if (isClosedForWrite) {
-        closedCause?.let { rethrowClosed(it) }
-        remainingPacket(limit)
-    } else {
-        readRemainingSuspend(limit)
+    override suspend fun readRemaining(limit: Long): ByteReadPacket {
+        try {
+            if (isClosedForWrite) {
+                log.traceFn(this, "readRemaining", "OnEnter")
+                closedCause?.let {
+                    log.debugFn(this, "readRemaining", "Channel closed, rethrow. closed={}", it)
+                    rethrowClosed(it)
+                }
+
+                log.traceFn(this, "readRemaining", "Calling remainingPacket. limit={}", limit)
+                val ret = remainingPacket(limit)
+                log.debugFn(this, "readRemaining", "Read remainingPacket. limit={} byteReadPacket={}", limit, ret)
+                return ret
+            } else {
+                log.traceFn(this, "readRemaining", "Calling readRemainingSuspend. limit={}", limit)
+                val ret = readRemainingSuspend(limit)
+                log.debugFn(this, "readRemaining", "Read readRemainingSuspend. limit={} byteReadPacket={}", limit, ret)
+                return ret
+            }
+        } catch (e: Throwable) {
+            log.traceFn(this, "readRemaining", "OnException. throwable={}", e)
+            throw e
+        } finally {
+            log.traceFn(this, "readRemaining", "OnExit")
+        }
     }
 
-    private fun remainingPacket(limit: Long): ByteReadPacket = buildPacket {
-        var remaining = limit
-        writeWhile { buffer ->
-            if (buffer.writeRemaining.toLong() > remaining) {
-                buffer.resetForWrite(remaining.toInt())
+    private fun remainingPacket(limit: Long): ByteReadPacket {
+        log.traceFn(this, "remainingPacket", "OnEnter")
+        val byteReadPacket = buildPacket {
+            var remaining = limit
+            log.traceFn(this@ByteBufferChannel, "remainingPacket.buildPacket", "OnEnter. remaining={}", remaining)
+
+            writeWhile { buffer ->
+                log.traceFn(this@ByteBufferChannel, "remainingPacket.writeWhile", "OnEnter. buffer={}", buffer)
+
+                val bufWriteRemain = buffer.writeRemaining.toLong()
+                if (bufWriteRemain > remaining) {
+                    buffer.resetForWrite(remaining.toInt())
+                    log.debugFn(
+                        this@ByteBufferChannel,
+                        "remainingPacket.writeWhile",
+                        "Reset buffer for write. bufferWriteRemaining={} remaining={}",
+                        bufWriteRemain,
+                        remaining
+                    )
+                }
+
+                val rc = readAsMuchAsPossible(buffer)
+                val before = remaining
+                remaining = before - rc
+                val isContinue = remaining > 0L && !isClosedForRead
+
+                log.traceFn(
+                    this@ByteBufferChannel,
+                    "remainingPacket.writeWhile",
+                    "read as much to buffer. remainingBefore={} read={} remainingAfter={} continue={} buffer={}",
+                    before,
+                    rc,
+                    remaining,
+                    isContinue,
+                    buffer
+                )
+
+                isContinue
             }
 
-            val rc = readAsMuchAsPossible(buffer)
-            remaining -= rc
-            remaining > 0L && !isClosedForRead
+            log.traceFn(this@ByteBufferChannel, "remainingPacket.buildPacket", "OnExit. remaining={}", remaining)
         }
+        log.traceFn(this, "remainingPacket", "OnExit")
+        return byteReadPacket
     }
 
     private suspend fun readRemainingSuspend(
         limit: Long
-    ): ByteReadPacket = buildPacket {
-        var remaining = limit
-        writeWhile { buffer ->
-            if (buffer.writeRemaining.toLong() > remaining) {
-                buffer.resetForWrite(remaining.toInt())
+    ): ByteReadPacket {
+        log.traceFn(this, "readRemainingSuspend", "OnEnter")
+        val byteReadPacket = buildPacket {
+            var remaining = limit
+            log.traceFn(this@ByteBufferChannel, "readRemainingSuspend.buildPacket", "OnEnter. remaining={}", remaining)
+
+            writeWhile { buffer ->
+                log.traceFn(this@ByteBufferChannel, "readRemainingSuspend.writeWhile", "OnEnter. buffer={}", buffer)
+
+                val bufWriteRemain = buffer.writeRemaining.toLong()
+                if (bufWriteRemain > remaining) {
+                    buffer.resetForWrite(remaining.toInt())
+                    log.debugFn(
+                        this@ByteBufferChannel,
+                        "readRemainingSuspend.writeWhile",
+                        "Reset buffer for write. bufferWriteRemaining={} remaining={}",
+                        bufWriteRemain,
+                        remaining
+                    )
+
+                }
+
+                val rc = readAsMuchAsPossible(buffer)
+                val before = remaining
+                remaining = before - rc
+                val isContinue = remaining > 0L && !isClosedForRead && readSuspend(1)
+
+                log.traceFn(
+                    this@ByteBufferChannel,
+                    "readRemainingSuspend.writeWhile",
+                    "read as much to buffer. remainingBefore={} read={} remainingAfter={} continue={} buffer={}",
+                    before,
+                    rc,
+                    remaining,
+                    isContinue,
+                    buffer
+                )
+
+                isContinue
             }
 
-            val rc = readAsMuchAsPossible(buffer)
-            remaining -= rc
-            remaining > 0L && !isClosedForRead && readSuspend(1)
-        }
+            closedCause?.let {
+                log.debugFn(
+                    this@ByteBufferChannel,
+                    "readRemainingSuspend.buildPacket",
+                    "channel closed. closedCause={}",
+                    it
+                )
+                throw it
+            }
 
-        closedCause?.let { throw it }
+            log.traceFn(this@ByteBufferChannel, "readRemainingSuspend.buildPacket", "OnExit. remaining={}", remaining)
+        }
+        log.traceFn(this, "readRemainingSuspend", "OnExit")
+        return byteReadPacket
     }
 
     private fun resumeReadOp() {
